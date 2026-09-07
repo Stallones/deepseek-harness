@@ -24,6 +24,8 @@ import type { ResolvedRetryPolicy, RetryPolicyConfig } from '@deepseek-ai/dsh-ll
 import {
   CACHE_CONTROL_FORMATS,
   CHAT_TEMPLATE_VARS,
+  CODEBUDDY_DISPLAY_NAME,
+  CODEBUDDY_PROVIDER_ID,
   MAX_TOKENS_FIELDS,
   MODALITIES,
   resolveRouteModels,
@@ -447,7 +449,8 @@ export function resolveProfiles(
     // The route key, not the installed provider's own name: the directory has
     // always shown route keys, and a catalog route must not silently rename
     // itself on every configuration surface just because it gained a profile.
-    const displayName = source.displayName ?? provider
+    const displayName = source.displayName
+      ?? (provider === CODEBUDDY_PROVIDER_ID ? CODEBUDDY_DISPLAY_NAME : provider)
     const catalog = resolveRouteModels({
       provider,
       ...source.api === undefined ? {} : { api: source.api },
@@ -459,6 +462,12 @@ export function resolveProfiles(
       defaultContextWindow: source.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW,
       defaultMaxTokens: source.defaultMaxTokens ?? DEFAULT_MAX_TOKENS,
     })
+    // DSH 内置路由（cb）的协议与端点来自目录默认值；显式配置仍可覆盖。
+    // pi-ai 自带 catalog 路由不在这里注入：它们可能按模型分发不同协议/端点，
+    // 必须在 provider.ts 里复用自带 Provider 保持逐模型分发。
+    const isCodeBuddyBuiltin = provider === CODEBUDDY_PROVIDER_ID
+    const routeApi = source.api ?? (isCodeBuddyBuiltin ? catalog.models[0]?.api : undefined)
+    const routeBaseUrl = source.baseURL ?? (isCodeBuddyBuiltin ? catalog.models[0]?.baseUrl : undefined)
     const { apiKeyEnv, retryPolicy, models: _models, displayName: _displayName, ...rest } = source
     resolved.set(provider, {
       ...rest,
@@ -476,8 +485,8 @@ export function resolveProfiles(
       piProvider: buildProvider({
         provider,
         displayName,
-        ...source.api === undefined ? {} : { api: source.api },
-        ...source.baseURL === undefined ? {} : { baseURL: source.baseURL },
+        ...routeApi === undefined ? {} : { api: routeApi },
+        ...routeBaseUrl === undefined ? {} : { baseURL: routeBaseUrl },
         models: catalog.models,
         namesCredential: apiKeyEnv !== undefined,
       }),

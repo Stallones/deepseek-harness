@@ -61,6 +61,12 @@ import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import type { ResolvedPiAiProviderProfile } from './config.ts'
 import { toPiContext } from './context.ts'
 import { toStreamChunks } from './stream.ts'
+import {
+  buildCodeBuddyHeaders,
+  codeBuddyDebugFetch,
+  CodeBuddyMonitorStore,
+  derivePreviousResponseId,
+} from './codebuddy.ts'
 
 /** One resolution's frozen view: the profiles and the collection built from them. */
 interface PiAiSnapshot {
@@ -218,6 +224,8 @@ function requestHeaders(headers: Readonly<Record<string, string>> | undefined): 
  */
 export class PiAiAdapter extends LlmAdapter {
   private snapshot: PiAiSnapshot | undefined
+  /** cb 路由会话计时态（monitor_* 四件套），纯内存，见 codebuddy.ts。 */
+  private readonly monitorStore = new CodeBuddyMonitorStore()
 
   constructor(private readonly config: PiAiAdapterOptions) {
     super()
@@ -372,15 +380,55 @@ export class PiAiAdapter extends LlmAdapter {
             maxBytes: profile.requestImageMaxBytes,
           },
         }, onReplayDegrade)
+      // cb 路由（CodeBuddy）出站形态：官方 craft 头 + previous_response_id + monitor。
+      const isCodeBuddy = options.provider === 'cb'
+      const sessionId = options.sessionId === undefined ? undefined : String(options.sessionId)
+      const monitor = isCodeBuddy && sessionId !== undefined
+        ? this.monitorStore.snapshot(sessionId)
+        : undefined
+      if (monitor !== undefined && monitor.promptPrepareStart === undefined) {
+        monitor.promptPrepareStart = Date.now()
+      }
+      const prevResponseId = isCodeBuddy
+        ? derivePreviousResponseId(options.messages)
+        : undefined
+      const profileHeaders = requestHeaders(profile.headers)
+      const mergedHeaders = isCodeBuddy && sessionId !== undefined
+        ? { ...profileHeaders, ...buildCodeBuddyHeaders(sessionId, model.id, monitor) }
+        : profileHeaders
+      // cb 路由可选的出站 wire 日志（DSH_CB_LOG 开启时注入 fetch 包装器）。
+      const cbDebugFetch = isCodeBuddy && sessionId !== undefined
+        ? codeBuddyDebugFetch(sessionId, model.id)
+        : undefined
       const events = snapshot.models.streamSimple(model, context, {
         ...profileOptions(profile, reasoning, apiKey),
         ...options.temperature === undefined ? {} : { temperature: options.temperature },
         ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
         ...options.sessionId === undefined ? {} : { sessionId: String(options.sessionId) },
+        ...cbDebugFetch === undefined ? {} : { fetch: cbDebugFetch },
         signal: watchdog.signal,
         // Profile headers are deployment-owned; attribution names are
-        // Harness-owned and therefore win collisions.
-        headers: requestHeaders(profile.headers),
+        // Harness-owned and therefore win collisions. cb 路由叠加 CodeBuddy craft 头。
+        headers: mergedHeaders,
+        // cb 路由：把上一轮 responseId 写成 body 的 previous_response_id（首轮缺省跳过）。
+        ...isCodeBuddy && prevResponseId !== undefined
+          ? {
+            onPayload: async (payload: unknown) => {
+              if (payload !== null && typeof payload === 'object') {
+                ;(payload as Record<string, unknown>).previous_response_id = prevResponseId
+              }
+              return payload
+            },
+          }
+          : {},
+        // cb 路由：响应头到达时刻 → monitor_firstByteTime。
+        ...isCodeBuddy && monitor !== undefined
+          ? {
+            onResponse: async () => {
+              monitor.firstByte = Date.now()
+            },
+          }
+          : {},
       })
       const iterator = toStreamChunks(events, model.contextWindow, options.signal)[Symbol.asyncIterator]()
       let exhausted = false
@@ -391,6 +439,7 @@ export class PiAiAdapter extends LlmAdapter {
           if (timeout !== undefined) throw timeout
           if (result.done) {
             exhausted = true
+            if (monitor !== undefined) monitor.streamEnd = Date.now()
             return
           }
           yield result.value

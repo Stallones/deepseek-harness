@@ -171,19 +171,114 @@ export function catalogProvider(provider: string): Provider | undefined {
 }
 
 /**
- * Every provider route the installed pi-ai catalog ships.
+ * Every provider route the installed pi-ai catalog ships, plus the DSH
+ * built-in routes (`cb`).
  * @returns the catalog provider ids.
  */
 export function catalogProviderIds(): readonly string[] {
-  return getBuiltinProviders()
+  return [...getBuiltinProviders(), CODEBUDDY_PROVIDER_ID]
 }
+
+/** CodeBuddy craft 主对话：DSH 内置路由的目录默认值（pi-ai 未随包提供 cb）。 */
+export const CODEBUDDY_PROVIDER_ID = 'cb'
+export const CODEBUDDY_DISPLAY_NAME = 'CodeBuddy'
+export const CODEBUDDY_BASE_URL = 'https://copilot.tencent.com/v2'
+
+const CODEBUDDY_MODELS: readonly Model<Api>[] = [
+  {
+    id: 'hy4-preview',
+    name: 'hy4-preview',
+    api: 'openai-completions',
+    provider: CODEBUDDY_PROVIDER_ID,
+    baseUrl: CODEBUDDY_BASE_URL,
+    reasoning: false,
+    input: ['text'],
+    cost: NO_COST,
+    contextWindow: 1000000,
+    maxTokens: 64000,
+    compat: { supportsDeveloperRole: false },
+  },
+  {
+    id: 'deepseek-v4-flash',
+    name: 'deepseek-v4-flash',
+    api: 'openai-completions',
+    provider: CODEBUDDY_PROVIDER_ID,
+    baseUrl: CODEBUDDY_BASE_URL,
+    reasoning: true,
+    thinkingLevelMap: {
+      off: null,
+      minimal: null,
+      low: null,
+      medium: null,
+      high: 'high',
+      xhigh: 'xhigh',
+      max: null,
+    },
+    input: ['text'],
+    cost: NO_COST,
+    contextWindow: 1000000,
+    maxTokens: 100000,
+    compat: { supportsDeveloperRole: false },
+  },
+  {
+    id: 'deepseek-v4-pro',
+    name: 'deepseek-v4-pro',
+    api: 'openai-completions',
+    provider: CODEBUDDY_PROVIDER_ID,
+    baseUrl: CODEBUDDY_BASE_URL,
+    reasoning: true,
+    thinkingLevelMap: {
+      off: null,
+      minimal: null,
+      low: null,
+      medium: null,
+      high: 'high',
+      xhigh: 'xhigh',
+      max: null,
+    },
+    input: ['text'],
+    cost: NO_COST,
+    contextWindow: 1000000,
+    maxTokens: 50000,
+    compat: { supportsDeveloperRole: false },
+  },
+  {
+    id: 'glm-5.3',
+    name: 'glm-5.3',
+    api: 'openai-completions',
+    provider: CODEBUDDY_PROVIDER_ID,
+    baseUrl: CODEBUDDY_BASE_URL,
+    reasoning: false,
+    input: ['text'],
+    cost: NO_COST,
+    contextWindow: 1000000,
+    maxTokens: 48000,
+    compat: { supportsDeveloperRole: false },
+  },
+  {
+    id: 'glm-5.3-flash',
+    name: 'glm-5.3-flash',
+    api: 'openai-completions',
+    provider: CODEBUDDY_PROVIDER_ID,
+    baseUrl: CODEBUDDY_BASE_URL,
+    reasoning: false,
+    input: ['text'],
+    cost: NO_COST,
+    contextWindow: 1000000,
+    maxTokens: 32000,
+    compat: { supportsDeveloperRole: false },
+  },
+]
 
 /**
  * The installed catalog models for one route, indexed by model id.
  * @param provider - provider route key.
- * @returns catalog models by id; empty for a route pi-ai does not ship.
+ * @returns catalog models by id; empty for a route neither pi-ai nor DSH ships.
  */
 export function catalogModels(provider: string): Map<string, Model<Api>> {
+  if (provider === CODEBUDDY_PROVIDER_ID) {
+    return new Map(CODEBUDDY_MODELS.map(model => [model.id, model]))
+  }
   if (!catalogProviders().has(provider)) return new Map()
   const models = getBuiltinModels(provider as BuiltinProvider) as Model<Api>[]
   return new Map(models.map(model => [model.id, model]))
