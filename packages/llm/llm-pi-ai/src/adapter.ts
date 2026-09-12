@@ -399,7 +399,7 @@ export class PiAiAdapter extends LlmAdapter {
         : undefined
       const profileHeaders = requestHeaders(profile.headers)
       const mergedHeaders = isCodeBuddy && sessionId !== undefined
-        ? { ...profileHeaders, ...buildCodeBuddyHeaders(sessionId, model.id, monitor) }
+        ? { ...profileHeaders, ...buildCodeBuddyHeaders(sessionId, model.id, monitor, apiKey) }
         : profileHeaders
       // cb 路由可选的出站 wire 日志（DSH_CB_LOG 开启时注入 fetch 包装器）。
       const cbDebugFetch = isCodeBuddy && sessionId !== undefined

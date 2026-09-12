@@ -4,7 +4,8 @@
  * 目的：让 cb 路由直连 copilot.tencent.com 时，请求长得像官方 Desktop，
  * 用于防风控/限流。全部逻辑是纯函数 + 极小的会话计时态，不 fork pi-ai。
  *
- * 关联文档：my-wb2api/docs/cb-direct-plan.md
+ * 形态基线：my-wb2api/docs/headers.md（逐头实测表 + ID 生成规则）、
+ * my-wb2api/docs/body.md §10（DSH cb 路由 vs 官方 逐项核对）。
  * @module dsh-llm-pi-ai/codebuddy
  */
 
@@ -14,18 +15,37 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Message } from '@deepseek-ai/dsh-llm'
 
-/** 官方 Desktop 静态头（抓包实录，live-body §4）。 */
+/**
+ * 官方 Desktop 版本。静态头里的 UA / X-IDE-Version / X-Product-Version 三处由它派生，
+ * 升级时只改这里。
+ *
+ * 4.11.3 → 4.12.0 的形态差异（my-wb2api/docs/headers.md §9）：`X-Agent-Intent` 的
+ * `custom` 形态消失（改 `web-fetch`）；模型改 `deepseek-v4.1-flash`；`reasoning_effort`
+ * 上限由 `xhigh` 改 `max`；`max_tokens` 改 128000；**新增必带 `X-Device-Token-Error`**。
+ */
+const CODEBUDDY_VERSION = '4.12.0'
+
+/** 官方 Desktop 静态头（抓包实录，my-wb2api/docs/headers.md §2）。 */
 const CODEBUDDY_STATIC_HEADERS: Readonly<Record<string, string>> = {
   // 必须覆盖 DSH 的 attribution User-Agent（deepseek-harness/…），否则
   // CodeBuddy 安全策略返回 11128 / 400 拦截。
-  'User-Agent': 'CodeBuddyIDE/4.11.3 CodeBuddy/4.11.3',
+  'User-Agent': `CodeBuddyIDE/${CODEBUDDY_VERSION} CodeBuddy/${CODEBUDDY_VERSION}`,
   'X-IDE-Type': 'CodeBuddyIDE',
   'X-IDE-Name': 'CodeBuddyIDE',
-  'X-IDE-Version': '4.11.3',
-  'X-Product-Version': '4.11.3',
+  'X-IDE-Version': CODEBUDDY_VERSION,
+  'X-Product-Version': CODEBUDDY_VERSION,
   'X-Env-ID': 'production',
   'X-Product': 'SaaS',
+  'X-Domain': 'www.codebuddy.cn',
   'X-Requested-With': 'XMLHttpRequest',
+  'sec-fetch-mode': 'cors',
+  'accept-language': '*',
+  // 4.12.0 起**每条 chat 必带**（4.11.3 完全不发此头）。实测当日 28/28。
+  // 语义是「SDK 未初始化」的客户端故障标记——官方真实客户端就是带着它跑的。
+  'X-Device-Token-Error': 'sdk_not_initialized',
+  // 官方链级「产品码」，实测唯一取值。注意：官方**部分链不带**此头，产生规则
+  // 至今未解（headers.md §3.2）；此处按多数形态恒发。
+  'X-Product-Code': 'codebuddy',
 }
 
 /** 会话内恒定的确定性派生（见 cb-direct-plan §2）。 */
@@ -37,15 +57,49 @@ const DERIVED_KEYS = {
   parent: ':parent',
 } as const
 
-/** md5 成 32hex（官方 conversation/request/trace/parent 均为 32hex）。 */
+/**
+ * md5 成 32hex。只用于**非 ID 形态**的确定性派生种子：
+ * 官方 `x-trace-id` 就是「纯随机 32hex，不是 UUID」（第 13 位不固定为 4），
+ * md5 输出正好同形，且天然满足「链内恒定」。
+ */
 function md5Hex(input: string): string {
   return createHash('md5').update(input).digest('hex')
 }
 
-/** 每请求唯一的 32hex（message-id / span；官方同款随机）。 */
-function randomHex(): string {
-  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16))
-  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
+/** n 字节随机 → 2n 位 hex。官方 `x-b3-spanid` / `x-b3-parentspanid` = 8 字节 = **16hex**。 */
+function randomHex(bytes: number): string {
+  const buf = globalThis.crypto.getRandomValues(new Uint8Array(bytes))
+  return Array.from(buf, b => b.toString(16).padStart(2, '0')).join('')
+}
+
+/**
+ * 把 32hex 掰成 UUIDv4 形态：第 13 位强制 `4`（version），第 17 位落 `89ab`（variant）。
+ *
+ * 官方 `x-conversation-id` / `-request-id` / `-message-id` 都是**随机 UUIDv4 去横线**，
+ * 实测 151/151 第 13 位恒为 `4`（headers.md §4）。直接拿 md5 当这些值会露馅 ——
+ * md5 的第 13 位是自由的，与官方形态不符。
+ */
+function asUuidV4(hex32: string): string {
+  const chars = hex32.split('')
+  chars[12] = '4'
+  chars[16] = '89ab'[Number.parseInt(chars[16] ?? '0', 16) % 4] ?? '8'
+  return chars.join('')
+}
+
+/** 会话内确定的 **UUIDv4 去横线（32hex）**——官方 conversation / request / message-id 形态。 */
+function seededUuidV4Hex(seed: string): string {
+  return asUuidV4(md5Hex(seed))
+}
+
+/** 会话内确定的 **UUIDv4 保留横线（36 位）**——官方 `x-request-trace-id` 形态。 */
+function seededUuidV4(seed: string): string {
+  const h = seededUuidV4Hex(seed)
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
+}
+
+/** 每请求唯一的 **UUIDv4 去横线（32hex）**——官方 `x-conversation-message-id` 形态。 */
+function randomUuidV4Hex(): string {
+  return asUuidV4(randomHex(16))
 }
 
 /**
@@ -62,31 +116,62 @@ export interface CodeBuddyMonitorState {
 }
 
 /**
+ * 从 CodeBuddy access token（JWT）里取账号 uid —— 官方 `X-User-Id` 的值（`sub` 声明）。
+ * 解析不了就返回 undefined，调用方据此省略该头（它是惰性头，缺了不影响功能）。
+ */
+function userIdFromToken(apiKey: string | undefined): string | undefined {
+  if (apiKey === undefined || apiKey === '') return undefined
+  const parts = apiKey.split('.')
+  if (parts.length !== 3) return undefined
+  try {
+    const payload: unknown = JSON.parse(Buffer.from(parts[1] ?? '', 'base64url').toString('utf8'))
+    if (payload === null || typeof payload !== 'object') return undefined
+    const sub = (payload as { sub?: unknown }).sub
+    return typeof sub === 'string' && sub.length > 0 ? sub : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * 出站 craft 头（会话头 + 静态头 + trace/b3 + monitor）。
+ *
+ * ID 形态严格对齐官方（my-wb2api/docs/headers.md §4）：
+ * - 会话/请求/message-id：**UUIDv4 去横线**（第 13 位 = `4`）
+ * - `x-trace-id` / `x-b3-traceid`：**纯随机 32hex，非 UUID**
+ * - `x-b3-spanid` / `x-b3-parentspanid`：**16hex**
+ * - `x-request-trace-id`：**UUIDv4 保留横线（36）**
+ *
  * @param sessionId - DSH 会话 UUID（`options.sessionId`）。
  * @param modelId - 目标模型 id。
  * @param monitor - 会话计时快照（首轮可为空）。
+ * @param apiKey - 该路由的 access token（JWT），用于派生 `X-User-Id`。
  */
 export function buildCodeBuddyHeaders(
   sessionId: string,
   modelId: string,
   monitor: CodeBuddyMonitorState | undefined,
+  apiKey?: string,
 ): Record<string, string> {
   const base = sessionId
+  // trace 族：官方是纯随机 32hex 且**链内恒定** —— md5 派生同形且稳定。
   const trace = md5Hex(base + DERIVED_KEYS.trace)
-  const parent = md5Hex(base + DERIVED_KEYS.parent)
-  const span = randomHex()
-  const messageId = randomHex()
+  // b3 的 span / parent 官方是 8 字节 = 16hex（此前误用 32hex）。
+  const parent = md5Hex(base + DERIVED_KEYS.parent).slice(0, 16)
+  const span = randomHex(8)
+  // message-id 是**每请求**新的 UUIDv4 去横线；它同时是上游响应的 id 来源
+  // （官方把它原样回显为 response.id，下一轮再作为 previous_response_id 发回）。
+  const messageId = randomUuidV4Hex()
 
   const headers: Record<string, string> = {
     'X-Agent-Intent': 'craft',
-    'X-Conversation-ID': md5Hex(base + DERIVED_KEYS.conversation),
-    'X-Conversation-Request-ID': md5Hex(base + DERIVED_KEYS.request),
+    'X-Conversation-ID': seededUuidV4Hex(base + DERIVED_KEYS.conversation),
+    'X-Conversation-Request-ID': seededUuidV4Hex(base + DERIVED_KEYS.request),
     'X-Conversation-Message-ID': messageId,
-    'X-Request-ID': md5Hex(base + DERIVED_KEYS.request),
+    'X-Request-ID': seededUuidV4Hex(base + DERIVED_KEYS.request),
     'X-Model-ID': modelId,
     ...CODEBUDDY_STATIC_HEADERS,
-    'X-Request-Trace-Id': md5Hex(base + DERIVED_KEYS.requestTrace),
+    'X-Request-Trace-Id': seededUuidV4(base + DERIVED_KEYS.requestTrace),
     'X-Trace-ID': trace,
     b3: `${trace}-${span}-1-${parent}`,
     'X-B3-TraceId': trace,
@@ -94,6 +179,9 @@ export function buildCodeBuddyHeaders(
     'X-B3-ParentSpanId': parent,
     'X-B3-Sampled': '1',
   }
+
+  const userId = userIdFromToken(apiKey)
+  if (userId !== undefined) headers['X-User-Id'] = userId
 
   if (monitor?.promptPrepareStart !== undefined) {
     headers['monitor_promptPrepareStartTime'] = String(monitor.promptPrepareStart)
